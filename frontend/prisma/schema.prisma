@@ -1,0 +1,456 @@
+// Prisma schema for langgraph-visualizer.
+// Docs: https://pris.ly/d/prisma-schema
+//
+// Naming: field names mirror the product spec (e.g. Created_At, Project_Id).
+// Relation fields are lowercase (project, prompt, versions) to distinguish
+// them from the scalar FK columns they read from.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Connection URL lives in prisma.config.ts (Prisma 7 no longer accepts `url` here).
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ProviderType {
+  OpenAI
+  Anthropic
+  Google
+  Custom
+}
+
+enum RunStatus {
+  Success
+  Failed
+  Timeout
+}
+
+enum WorkflowNodeType {
+  Prompt
+  Tool
+  Custom
+}
+
+enum WorkflowEdgeType {
+  loop
+  conditional
+  normal
+}
+
+enum WorkflowRunStatus {
+  Pending
+  Running
+  Completed
+  Completed_With_Errors
+  Failed
+}
+
+enum EvaluationRunStatus {
+  Pending
+  Running
+  Completed
+  Completed_With_Errors
+  Failed
+}
+
+enum ProjectRole {
+  Owner
+  Admin
+  Regular
+  Viewer
+}
+
+enum ExecutionType {
+  Mock
+  HTTP
+  Langchain_Native
+}
+
+// ---------------------------------------------------------------------------
+// Projects, members, users
+// ---------------------------------------------------------------------------
+
+model Project {
+  id          String   @id @default(uuid()) @db.Uuid
+  Name        String
+  Description String?
+  Created_At  DateTime @default(now())
+  Updated_At  DateTime @updatedAt
+
+  members             ProjectMember[]
+  prompts             Prompt[]
+  runs                Run[]
+  workflows           Workflow[]
+  customScripts       CustomScript[]
+  datasets            Dataset[]
+  evaluationRuns      EvaluationRun[]
+  toolGroups          ToolGroup[]
+  tools               Tool[]
+  providerCredentials ProviderCredentials[]
+}
+
+model User {
+  id               String   @id @default(uuid()) @db.Uuid
+  Name             String
+  Email            String   @unique
+  External_Auth_Id String   @unique // webhook to WorkOS
+  Created_At       DateTime @default(now())
+  Updated_At       DateTime @updatedAt
+
+  memberships         ProjectMember[]
+  providerCredentials ProviderCredentials[]
+}
+
+model ProjectMember {
+  id         String      @id @default(uuid()) @db.Uuid
+  Project_Id String      @db.Uuid
+  User_Id    String      @db.Uuid
+  Role       ProjectRole
+  Created_At DateTime    @default(now())
+  Updated_At DateTime    @updatedAt
+
+  project Project @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [User_Id], references: [id], onDelete: Cascade)
+
+  @@unique([Project_Id, User_Id])
+  @@index([User_Id])
+}
+
+// ---------------------------------------------------------------------------
+// Prompts & versions
+// ---------------------------------------------------------------------------
+
+model Prompt {
+  id              String   @id @default(uuid()) @db.Uuid
+  Name            String
+  Project_Id      String   @db.Uuid
+  Best_Version_Id String?  @db.Uuid // null for new prompts
+  Description     String?
+  Created_At      DateTime @default(now())
+  Updated_At      DateTime @updatedAt
+
+  project      Project   @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  versions     Version[] @relation("PromptVersions")
+  best_version Version?  @relation("PromptBestVersion", fields: [Best_Version_Id], references: [id], onDelete: SetNull)
+  runs         Run[]
+
+  @@unique([Project_Id, Name])
+  @@index([Best_Version_Id])
+}
+
+model Version {
+  id                  String   @id @default(uuid()) @db.Uuid
+  Prompt_Id           String   @db.Uuid
+  Name                String
+  Default_Temperature Float
+  Default_Top_P       Float
+  Default_Max_Tokens  Int
+  // Array of langgraph_core.messages BaseMessage objects. Images/documents are
+  // referenced via image_url / file_url pointing at an S3 URI (validated via
+  // boto3 in the backend before persistence).
+  Version_Messages    Json
+  // Tool ids stored as raw UUID strings (not a Tool relation) to avoid a join.
+  Bound_Tools         String[] @db.Uuid
+  Response_Schema     Json
+  Context_Schema      Json
+  Description         String?
+  Created_At          DateTime @default(now())
+
+  prompt         Prompt          @relation("PromptVersions", fields: [Prompt_Id], references: [id], onDelete: Cascade)
+  bestOfPrompts  Prompt[]        @relation("PromptBestVersion")
+  runs           Run[]
+  evaluationRuns EvaluationRun[]
+
+  @@unique([Prompt_Id, Name])
+}
+
+// ---------------------------------------------------------------------------
+// Single-prompt runs
+// ---------------------------------------------------------------------------
+
+model Run {
+  id                  String       @id @default(uuid()) @db.Uuid
+  Workflow_Run_Id     String?      @db.Uuid // null if not part of a workflow
+  Prompt_Id           String?      @db.Uuid // null if prompt not yet saved
+  Version_Id          String?      @db.Uuid // null if version not yet saved
+  Project_Id          String       @db.Uuid // runs always belong to a project
+  Executed_At         DateTime     @default(now())
+  Model_Company       ProviderType
+  Model_Name          String
+  Model_Output        Json
+  Input_Variables     Json // { variable_name: variable_value } for injection
+  Output_Quality      Json
+  Speed               Int // milliseconds
+  Input_Tokens        Int
+  Output_Tokens       Int
+  Estimated_Cost      Float
+  Formatting_Accuracy Float
+  Temperature         Float // per-run override of the version default
+  Top_P               Float
+  Max_Tokens          Int
+  Status              RunStatus
+  Status_Message      String // error message or a 200 OK string
+
+  project     Project      @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  prompt      Prompt?      @relation(fields: [Prompt_Id], references: [id], onDelete: SetNull)
+  version     Version?     @relation(fields: [Version_Id], references: [id], onDelete: SetNull)
+  workflowRun WorkflowRun? @relation(fields: [Workflow_Run_Id], references: [id], onDelete: SetNull)
+
+  @@index([Project_Id])
+  @@index([Prompt_Id])
+  @@index([Version_Id])
+  @@index([Workflow_Run_Id])
+}
+
+// ---------------------------------------------------------------------------
+// Canvas: workflows, nodes, edges
+// ---------------------------------------------------------------------------
+
+model Workflow {
+  id         String   @id @default(uuid()) @db.Uuid
+  Group      String
+  Name       String
+  Project_Id String   @db.Uuid
+  Created_At DateTime @default(now())
+  Updated_At DateTime @updatedAt
+
+  project        Project         @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  nodes          WorkflowNode[]
+  edges          WorkflowEdge[]
+  runs           WorkflowRun[]
+  evaluationRuns EvaluationRun[]
+
+  @@unique([Project_Id, Name])
+}
+
+model WorkflowNode {
+  id           String           @id @default(uuid()) @db.Uuid
+  Workflow_Id  String           @db.Uuid
+  Type         WorkflowNodeType
+  X_Coordinate Int
+  Y_Coordinate Int
+  // prompt_version_id | tool_id | tool_group_id | custom_script_id, per Type
+  Configuration Json
+  Name          String // does not have to be unique
+  Description   String?
+  Created_At    DateTime         @default(now())
+  Updated_At    DateTime         @updatedAt
+
+  workflow    Workflow       @relation(fields: [Workflow_Id], references: [id], onDelete: Cascade)
+  sourceEdges WorkflowEdge[] @relation("EdgeSource")
+  targetEdges WorkflowEdge[] @relation("EdgeTarget")
+
+  @@index([Workflow_Id])
+}
+
+model WorkflowEdge {
+  id             String           @id @default(uuid()) @db.Uuid
+  Workflow_Id    String           @db.Uuid
+  Type           WorkflowEdgeType
+  // For conditional edges: the key in the routing JSON. One edge row per branch.
+  Routing_Key    String?
+  Source_Node_Id String           @db.Uuid
+  Target_Node_Id String           @db.Uuid
+  Name           String // does not need to be unique
+  Description    String?
+  Created_At     DateTime         @default(now())
+  Updated_At     DateTime         @updatedAt
+
+  workflow   Workflow     @relation(fields: [Workflow_Id], references: [id], onDelete: Cascade)
+  sourceNode WorkflowNode @relation("EdgeSource", fields: [Source_Node_Id], references: [id], onDelete: Cascade)
+  targetNode WorkflowNode @relation("EdgeTarget", fields: [Target_Node_Id], references: [id], onDelete: Cascade)
+
+  @@index([Workflow_Id])
+  @@index([Source_Node_Id])
+  @@index([Target_Node_Id])
+}
+
+model WorkflowRun {
+  id                String            @id @default(uuid()) @db.Uuid
+  Workflow_Id       String            @db.Uuid
+  Status            WorkflowRunStatus
+  Input_Variables   Json // initial langgraph state class
+  Final_Output      Json // final state class
+  Execution_Time_ms Int
+  Total_Cost        Float
+  Created_At        DateTime          @default(now())
+  Updated_At        DateTime          @updatedAt
+
+  workflow Workflow @relation(fields: [Workflow_Id], references: [id], onDelete: Cascade)
+  runs     Run[]
+
+  @@index([Workflow_Id])
+}
+
+// Custom scripts (currently all routers must be custom). Code is shipped to an
+// isolated runtime (Docker/WASM/Cloud Function/Lambda) for execution.
+model CustomScript {
+  id                    String   @id @default(uuid()) @db.Uuid
+  Name                  String
+  Code                  String   @db.Text
+  Expected_State_Schema Json
+  Project_Id            String   @db.Uuid
+  Created_At            DateTime @default(now())
+  Updated_At            DateTime @updatedAt
+
+  project Project @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+
+  @@unique([Project_Id, Name])
+}
+
+// ---------------------------------------------------------------------------
+// Testing: datasets, test cases, evaluations
+// ---------------------------------------------------------------------------
+
+model Dataset {
+  id          String   @id @default(uuid()) @db.Uuid
+  Name        String
+  Project_Id  String   @db.Uuid
+  Description String?
+  Created_At  DateTime @default(now())
+  Updated_At  DateTime @updatedAt
+
+  project        Project         @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  testCases      TestCase[]
+  evaluationRuns EvaluationRun[]
+
+  @@unique([Project_Id, Name])
+}
+
+model TestCase {
+  id              String   @id @default(uuid()) @db.Uuid
+  Name            String
+  Dataset_Id      String   @db.Uuid
+  Description     String?
+  Input_Variables Json
+  Expected_Output String
+  Assertion_Rules Json
+  Created_At      DateTime @default(now())
+  Updated_At      DateTime @updatedAt
+
+  dataset           Dataset            @relation(fields: [Dataset_Id], references: [id], onDelete: Cascade)
+  evaluationResults EvaluationResult[]
+
+  @@unique([Dataset_Id, Name])
+}
+
+model EvaluationRun {
+  id            String              @id @default(uuid()) @db.Uuid
+  Dataset_Id    String              @db.Uuid
+  Version_Id    String?             @db.Uuid // for testing prompt versions
+  Workflow_Id   String?             @db.Uuid // for testing workflows
+  Project_Id    String              @db.Uuid // for per-project analysis
+  Overall_Score Float
+  Total_Cost    Float
+  Pass_Rate     Float
+  Status        EvaluationRunStatus
+  Created_At    DateTime            @default(now())
+  Updated_At    DateTime            @updatedAt
+
+  dataset  Dataset            @relation(fields: [Dataset_Id], references: [id], onDelete: Cascade)
+  project  Project            @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  version  Version?           @relation(fields: [Version_Id], references: [id], onDelete: SetNull)
+  workflow Workflow?          @relation(fields: [Workflow_Id], references: [id], onDelete: SetNull)
+  results  EvaluationResult[]
+
+  @@index([Dataset_Id])
+  @@index([Project_Id])
+  @@index([Version_Id])
+  @@index([Workflow_Id])
+}
+
+model EvaluationResult {
+  id                      String   @id @default(uuid()) @db.Uuid
+  Evaluation_Run_Id       String   @db.Uuid
+  Test_Case_Id            String   @db.Uuid
+  Executed_At             DateTime @default(now())
+  Passed                  Boolean
+  Output                  Json? // what the model returned
+  Latency_ms              Int
+  Input_Tokens            Int
+  Output_Tokens           Int
+  Error_Logs              String?
+  Cost                    Float
+  Score                   Float?
+  Assertion_Snapshot      Json // snapshot in case the test case changes
+  Expected_Output_Snapshot String // snapshot in case the test case changes
+
+  evaluationRun EvaluationRun @relation(fields: [Evaluation_Run_Id], references: [id], onDelete: Cascade)
+  testCase      TestCase      @relation(fields: [Test_Case_Id], references: [id], onDelete: Cascade)
+
+  @@index([Evaluation_Run_Id])
+  @@index([Test_Case_Id])
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+model ToolGroup {
+  id          String   @id @default(uuid()) @db.Uuid
+  Name        String
+  Project_Id  String   @db.Uuid
+  Description String?
+  Created_At  DateTime @default(now())
+  Updated_At  DateTime @updatedAt
+
+  project Project @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  tools   Tool[]
+
+  @@unique([Project_Id, Name])
+}
+
+model Tool {
+  id            String        @id @default(uuid()) @db.Uuid
+  // Backend must enforce ^[A-Za-z0-9_]+$ (letters, numbers, underscores only).
+  Name          String
+  Project_Id    String?       @db.Uuid // null (with Tool_Group_Id null) => global tool
+  Tool_Group_Id String?       @db.Uuid
+  // Non-null: the LLM reads the docstring to understand what the tool does.
+  Description   String
+  Execution_Type   ExecutionType
+  // Execution-type-specific config (kept as JSON to avoid polymorphic tables /
+  // nullable columns). Should carry a version tag to avoid invalidating old tools.
+  Execution_Config Json
+  Payload_Schema   Json
+  // Optional: filter/reshape large responses on the backend.
+  Response_Mapping Json?
+  Active           Boolean       @default(true)
+  Created_At       DateTime      @default(now())
+  Updated_At       DateTime      @updatedAt
+
+  project   Project?   @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  toolGroup ToolGroup? @relation(fields: [Tool_Group_Id], references: [id], onDelete: SetNull)
+
+  @@index([Project_Id])
+  @@index([Tool_Group_Id])
+}
+
+// ---------------------------------------------------------------------------
+// Provider credentials
+// ---------------------------------------------------------------------------
+
+model ProviderCredentials {
+  id                String       @id @default(uuid()) @db.Uuid
+  Project_Id        String       @db.Uuid
+  Added_By_Id       String?      @db.Uuid // nullable so deleting a user doesn't cascade credentials
+  Name              String // allows multiple keys per provider (fallbacks / use cases)
+  Description       String
+  Provider_Name     ProviderType
+  Base_URL          String? // for custom providers
+  Encrypted_API_Key String
+  Created_At        DateTime     @default(now())
+  Updated_At        DateTime     @updatedAt
+
+  project Project @relation(fields: [Project_Id], references: [id], onDelete: Cascade)
+  addedBy User?   @relation(fields: [Added_By_Id], references: [id], onDelete: SetNull)
+
+  @@unique([Project_Id, Name])
+  @@index([Added_By_Id])
+}
