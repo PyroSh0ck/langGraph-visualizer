@@ -29,7 +29,7 @@ export default function promptCreation() {
 
   const onSubmit: SubmitHandler<Inputs> = async (data) => {
     try {
-      const response = await fetch("/api/promptCreation", {
+      const response = await fetch("/api/prompts", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -37,11 +37,47 @@ export default function promptCreation() {
         body: JSON.stringify(data),
       });
 
-      if (response.ok) {
-        console.log("Success :D");
-        alert("Prompt created successfully");
-      } else {
-        alert("Failed to create prompt");
+      if (!response.ok) {
+        alert("Failed to create prompt!");
+        return;
+      }
+
+      const prompt = await response.json();
+      console.log("Success :D", response);
+
+      alert("Prompt created successfully");
+
+      const versionResponse = await fetch("/api/versions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          ...data,
+          prompt_id: prompt.id,
+        }),
+      });
+
+      if (!versionResponse.ok) {
+        alert("Failed to create version");
+        return;
+      }
+
+      const version = await versionResponse.json();
+
+      const promptResponse = await fetch(`/api/prompts/${prompt.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          Best_Version_Id: version.id,
+        }),
+      });
+
+      if (!promptResponse.ok) {
+        alert("Failed to UPDATE prompt with best version");
+        return;
       }
     } catch (err) {
       alert(`Error has occurred: ${err}`);
