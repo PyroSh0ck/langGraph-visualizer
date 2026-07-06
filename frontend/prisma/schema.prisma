@@ -91,6 +91,7 @@ model Version {
   Default_Temperature Float
   Default_Top_P       Float
   Default_Max_Tokens  Int
+  Preferred_Model     String? // model id from lib/models.ts; null until chosen
   // Array of langgraph_core.messages BaseMessage objects. Images/documents are
   // referenced via image_url / file_url pointing at an S3 URI (validated via
   // boto3 in the backend before persistence).
